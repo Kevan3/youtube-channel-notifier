@@ -14,12 +14,11 @@ name: Notifier
 # - Manual-run inputs are read from the event file and masked, so they are not
 #   printed in the step's environment listing.
 #
+# Notifications (email, Discord, POST webhook, weekly summary) are disabled:
+# the page is the only output. Mail goes to Laravel's in-memory "array"
+# mailer and is discarded; no webhook URLs are configured.
+#
 # Required secrets:  YCN_DB_PASSPHRASE, YCN_PAGE_PASSPHRASE (different, 20+ chars)
-# Optional secrets:  ALERT_EMAILS, MAIL_HOST, MAIL_PORT, MAIL_USERNAME,
-#                    MAIL_PASSWORD, MAIL_FROM_ADDRESS, DISCORD_WEBHOOK_URL,
-#                    WEBHOOK_POST_URL
-# Optional vars:     MAIL_MAILER, MAIL_SCHEME, USER_TIMEZONE, USER_LANGUAGE,
-#                    DISPATCH_WEEKLY_SUMMARY_EMAIL
 #
 # Settings > Pages > Source must be set to "GitHub Actions".
 
@@ -45,9 +44,6 @@ on:
           - remove-excluded-word
           - list-excluded-words
           - stats
-          - test-mail
-          - test-discord
-          - test-webhook
       name:
         description: Channel label (add / remove / mute) or word (excluded words)
         required: false
@@ -109,7 +105,6 @@ jobs:
               echo "DATA_DIR=$RUNNER_TEMP/ycn-data"
               echo "LOGS_FILE=$RUNNER_TEMP/logs.json"
               echo "RUN_LOG=$RUNNER_TEMP/run.log"
-              echo "APP_ENV_FILE=$RUNNER_TEMP/app-env.sh"
               echo "SITE_DIR=$RUNNER_TEMP/site"
             } >> "$GITHUB_ENV"
             echo "ready=true" >> "$GITHUB_OUTPUT"
@@ -149,48 +144,15 @@ jobs:
 
       - name: Configure environment
         if: steps.setup.outputs.ready == 'true'
-        env:
-          IN_ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
-          IN_MAIL_HOST: ${{ secrets.MAIL_HOST }}
-          IN_MAIL_PORT: ${{ secrets.MAIL_PORT }}
-          IN_MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
-          IN_MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
-          IN_MAIL_FROM_ADDRESS: ${{ secrets.MAIL_FROM_ADDRESS }}
-          IN_DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          IN_WEBHOOK_POST_URL: ${{ secrets.WEBHOOK_POST_URL }}
-          IN_MAIL_MAILER: ${{ vars.MAIL_MAILER }}
-          IN_MAIL_SCHEME: ${{ vars.MAIL_SCHEME }}
-          IN_USER_TIMEZONE: ${{ vars.USER_TIMEZONE }}
-          IN_USER_LANGUAGE: ${{ vars.USER_LANGUAGE }}
-          IN_DISPATCH_WEEKLY_SUMMARY_EMAIL: ${{ vars.DISPATCH_WEEKLY_SUMMARY_EMAIL }}
         run: |
-          # Laravel reads real environment variables before .env. Settings go
-          # into a runner-local file that later steps source, not $GITHUB_ENV:
-          # values in $GITHUB_ENV are listed in every later step's log header,
-          # and only secrets are masked there. Only set values are exported:
-          # an empty ALERT_EMAILS would make the app try to email "".
-          : > "$APP_ENV_FILE"
-          for name in ALERT_EMAILS MAIL_HOST MAIL_PORT MAIL_USERNAME MAIL_PASSWORD \
-                      MAIL_FROM_ADDRESS DISCORD_WEBHOOK_URL WEBHOOK_POST_URL \
-                      MAIL_MAILER MAIL_SCHEME USER_TIMEZONE USER_LANGUAGE \
-                      DISPATCH_WEEKLY_SUMMARY_EMAIL; do
-            value="$(printenv "IN_$name" || true)"
-            if [ -n "$value" ]; then
-              printf 'export %s=%q\n' "$name" "$value" >> "$APP_ENV_FILE"
-            fi
-          done
-
-          # Without an SMTP host, log mail instead of failing to connect.
-          if [ -z "$IN_MAIL_HOST" ] && [ -z "$IN_MAIL_MAILER" ]; then
-            echo "export MAIL_MAILER=log" >> "$APP_ENV_FILE"
-          fi
-
           {
             echo "APP_ENV=production"
             echo "APP_DEBUG=false"
             echo "DB_CONNECTION=sqlite"
             echo "LOG_CHANNEL=stderr"
             echo "LOG_LEVEL=info"
+            # Notifications are disabled: mail is kept in memory and discarded.
+            echo "MAIL_MAILER=array"
             echo "APP_KEY="
           } > .env
           php artisan key:generate --force --no-interaction --quiet
@@ -198,9 +160,6 @@ jobs:
       - name: Restore data
         if: steps.setup.outputs.ready == 'true'
         run: |
-          # shellcheck source=/dev/null
-          . "$APP_ENV_FILE"
-
           decrypt() {
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
               -pass env:YCN_DB_PASSPHRASE -in "$1" -out "$2"
@@ -231,9 +190,6 @@ jobs:
         id: run
         if: steps.setup.outputs.ready == 'true'
         run: |
-          # shellcheck source=/dev/null
-          . "$APP_ENV_FILE"
-
           # Inputs come from the event file rather than `env:` so their values
           # are never printed in this step's environment listing.
           read_input() { jq -r --arg k "$1" '.inputs[$k] // ""' "$GITHUB_EVENT_PATH"; }
@@ -246,7 +202,7 @@ jobs:
           export INPUT_NAME INPUT_URL INPUT_CHANNEL_ID
 
           case "$COMMAND" in
-            list-*|stats|test-*) writes=false ;;
+            list-*|stats) writes=false ;;
             *) writes=true ;;
           esac
 
@@ -270,19 +226,6 @@ jobs:
             case "$COMMAND" in
               check)
                 php artisan channels:check --no-interaction
-
-                # Weekly summary: send once per ISO week (UTC). This replaces
-                # the app's Monday 00:00 schedule and still works if a run
-                # was delayed or skipped.
-                marker="$DATA_DIR/last-weekly-summary"
-                week="$(date -u +%G-W%V)"
-                last="$(cat "$marker" 2>/dev/null || true)"
-                if [ -z "$last" ]; then
-                  echo "$week" > "$marker"
-                elif [ "$last" != "$week" ]; then
-                  php artisan summaries:dispatch-weekly-summary --no-interaction
-                  echo "$week" > "$marker"
-                fi
                 ;;
 
               add-channel)
@@ -360,9 +303,6 @@ jobs:
               list-videos)         php artisan videos:list --no-interaction ;;
               list-excluded-words) php artisan excluded-words:list --no-interaction ;;
               stats)               php artisan other:stats --no-interaction ;;
-              test-mail)           php artisan other:mail-test --no-interaction ;;
-              test-discord)        php artisan other:discord-webhook-test --no-interaction ;;
-              test-webhook)        php artisan other:post-test --no-interaction ;;
 
               *)
                 echo "Unknown command: $COMMAND"
@@ -415,7 +355,7 @@ jobs:
           cd "$DATA_DIR"
           rm -rf .git
           git init --quiet --initial-branch "$DATA_BRANCH"
-          for file in database.sqlite.enc logs.json.enc last-weekly-summary; do
+          for file in database.sqlite.enc logs.json.enc; do
             if [ -f "$file" ]; then git add "$file"; fi
           done
           git -c user.name="github-actions[bot]" \
@@ -429,8 +369,6 @@ jobs:
       - name: Build page
         if: always() && steps.run.outputs.status != ''
         run: |
-          # shellcheck source=/dev/null
-          . "$APP_ENV_FILE"
           mkdir -p "$SITE_DIR"
           cp .github/ycn-page/index.html .github/ycn-page/app.js \
              .github/ycn-page/style.css .github/ycn-page/robots.txt "$SITE_DIR/"
