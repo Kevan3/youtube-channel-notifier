@@ -1,28 +1,37 @@
 name: Notifier
 
-# Runs YouTube Channel Notifier on GitHub Actions instead of a server.
+# Runs YouTube Channel Notifier on GitHub Actions instead of a server, and
+# publishes an encrypted, passphrase-protected video list to GitHub Pages.
 #
-# State (the SQLite database) lives on the `ycn-data` branch, encrypted with
-# the YCN_DB_PASSPHRASE secret. The branch is force-pushed as a single commit
-# on every run that changes data, so history never grows.
+# Privacy:
+# - The SQLite database and the run history live on the `ycn-data` branch,
+#   encrypted with YCN_DB_PASSPHRASE. The branch is force-pushed as a single
+#   commit every run, so history never grows.
+# - The Pages site only ever contains data encrypted with YCN_PAGE_PASSPHRASE;
+#   it is decrypted in the viewer's browser.
+# - Command output (which names channels and videos) never reaches the Actions
+#   log. It is stored encrypted and shown on the page's Activity tab.
+# - Manual-run inputs are read from the event file and masked, so they are not
+#   printed in the step's environment listing.
 #
-# Required secret:   YCN_DB_PASSPHRASE
+# Required secrets:  YCN_DB_PASSPHRASE, YCN_PAGE_PASSPHRASE (different, 20+ chars)
 # Optional secrets:  ALERT_EMAILS, MAIL_HOST, MAIL_PORT, MAIL_USERNAME,
 #                    MAIL_PASSWORD, MAIL_FROM_ADDRESS, DISCORD_WEBHOOK_URL,
 #                    WEBHOOK_POST_URL
 # Optional vars:     MAIL_MAILER, MAIL_SCHEME, USER_TIMEZONE, USER_LANGUAGE,
 #                    DISPATCH_WEEKLY_SUMMARY_EMAIL
+#
+# Settings > Pages > Source must be set to "GitHub Actions".
 
 on:
   schedule:
     # Every 30 minutes. GitHub runs schedules on a best-effort basis, so
-    # expect some delay. ~1,440 runs/month, within the 2,000 free minutes
-    # a private repo gets.
+    # expect some delay.
     - cron: '*/30 * * * *'
   workflow_dispatch:
     inputs:
       command:
-        description: What to run
+        description: What to run (output appears on the page's Activity tab)
         type: choice
         default: check
         options:
@@ -59,27 +68,46 @@ concurrency:
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
 
     env:
       COMMAND: ${{ inputs.command || 'check' }}
       DATA_BRANCH: ycn-data
       DATA_DIR: ${{ runner.temp }}/ycn-data
       DB_FILE: ${{ github.workspace }}/database/database.sqlite
+      LOGS_FILE: ${{ runner.temp }}/logs.json
+      RUN_LOG: ${{ runner.temp }}/run.log
+      SITE_DIR: ${{ runner.temp }}/site
       REMOTE: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
       YCN_DB_PASSPHRASE: ${{ secrets.YCN_DB_PASSPHRASE }}
+      YCN_PAGE_PASSPHRASE: ${{ secrets.YCN_PAGE_PASSPHRASE }}
 
     steps:
-      - name: Check passphrase is set
+      - name: Check passphrases
         run: |
-          if [ -z "$YCN_DB_PASSPHRASE" ]; then
-            echo "::error::Set the YCN_DB_PASSPHRASE repository secret first."
-            exit 1
+          fail=false
+          for name in YCN_DB_PASSPHRASE YCN_PAGE_PASSPHRASE; do
+            value="$(printenv "$name" || true)"
+            if [ "${#value}" -lt 20 ]; then
+              echo "::error::Set the $name repository secret to a random string of at least 20 characters."
+              fail=true
+            fi
+          done
+          if [ "$YCN_DB_PASSPHRASE" = "$YCN_PAGE_PASSPHRASE" ]; then
+            echo "::error::YCN_DB_PASSPHRASE and YCN_PAGE_PASSPHRASE must be different."
+            fail=true
           fi
+          [ "$fail" = false ]
 
       - uses: actions/checkout@v4
 
@@ -87,7 +115,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
-          extensions: mbstring, dom, simplexml, pdo_sqlite
+          extensions: mbstring, dom, simplexml, pdo_sqlite, openssl
           coverage: none
 
       - name: Cache vendor
@@ -141,34 +169,58 @@ jobs:
             echo "LOG_LEVEL=info"
             echo "APP_KEY="
           } > .env
-          php artisan key:generate --force --no-interaction
+          php artisan key:generate --force --no-interaction --quiet
 
-      - name: Restore database
+      - name: Restore data
         run: |
+          decrypt() {
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -pass env:YCN_DB_PASSPHRASE -in "$1" -out "$2"
+          }
+
           mkdir -p "$DATA_DIR"
           if git ls-remote --exit-code --heads "$REMOTE" "$DATA_BRANCH" > /dev/null; then
             git clone --quiet --depth 1 --branch "$DATA_BRANCH" "$REMOTE" "$DATA_DIR"
-            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
-              -pass env:YCN_DB_PASSPHRASE \
-              -in "$DATA_DIR/database.sqlite.enc" -out "$DB_FILE"
+          fi
+
+          if [ -f "$DATA_DIR/database.sqlite.enc" ]; then
+            decrypt "$DATA_DIR/database.sqlite.enc" "$DB_FILE"
             echo "Database restored."
           else
             touch "$DB_FILE"
-            echo "No $DATA_BRANCH branch yet; starting with an empty database."
+            echo "No saved database yet; starting with an empty one."
           fi
-          php artisan migrate --force --no-interaction
+
+          if [ -f "$DATA_DIR/logs.json.enc" ]; then
+            decrypt "$DATA_DIR/logs.json.enc" "$LOGS_FILE"
+          else
+            echo '[]' > "$LOGS_FILE"
+          fi
+
+          php artisan migrate --force --no-interaction --quiet
 
       - name: Run command
         id: run
-        env:
-          INPUT_NAME: ${{ inputs.name }}
-          INPUT_URL: ${{ inputs.url }}
-          INPUT_CHANNEL_ID: ${{ inputs.channel_id }}
         run: |
-          writes=true
+          # Inputs come from the event file rather than `env:` so their values
+          # are never printed in this step's environment listing.
+          read_input() { jq -r --arg k "$1" '.inputs[$k] // ""' "$GITHUB_EVENT_PATH"; }
+          INPUT_NAME="$(read_input name)"
+          INPUT_URL="$(read_input url)"
+          INPUT_CHANNEL_ID="$(read_input channel_id)"
+          for value in "$INPUT_NAME" "$INPUT_URL" "$INPUT_CHANNEL_ID"; do
+            if [ -n "$value" ]; then echo "::add-mask::$value"; fi
+          done
+          export INPUT_NAME INPUT_URL INPUT_CHANNEL_ID
+
+          case "$COMMAND" in
+            list-*|stats|test-*) writes=false ;;
+            *) writes=true ;;
+          esac
+
           require_name() {
             if [ -z "$INPUT_NAME" ]; then
-              echo "::error::The 'name' input is required for $COMMAND."
+              echo "The 'name' input is required for $COMMAND."
               exit 1
             fi
           }
@@ -181,126 +233,190 @@ jobs:
                 $app = require getenv("GITHUB_WORKSPACE")."/bootstrap/app.php";
                 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();'
 
-          case "$COMMAND" in
-            check)
-              php artisan channels:check --no-interaction
+          run_command() {
+            case "$COMMAND" in
+              check)
+                php artisan channels:check --no-interaction
 
-              # Weekly summary: send once per ISO week (UTC). This replaces
-              # the app's Monday 00:00 schedule and still works if a run
-              # was delayed or skipped.
-              marker="$DATA_DIR/last-weekly-summary"
-              week="$(date -u +%G-W%V)"
-              last="$(cat "$marker" 2>/dev/null || true)"
-              if [ -z "$last" ]; then
-                echo "$week" > "$marker"
-              elif [ "$last" != "$week" ]; then
-                php artisan summaries:dispatch-weekly-summary --no-interaction
-                echo "$week" > "$marker"
-              fi
-              ;;
+                # Weekly summary: send once per ISO week (UTC). This replaces
+                # the app's Monday 00:00 schedule and still works if a run
+                # was delayed or skipped.
+                marker="$DATA_DIR/last-weekly-summary"
+                week="$(date -u +%G-W%V)"
+                last="$(cat "$marker" 2>/dev/null || true)"
+                if [ -z "$last" ]; then
+                  echo "$week" > "$marker"
+                elif [ "$last" != "$week" ]; then
+                  php artisan summaries:dispatch-weekly-summary --no-interaction
+                  echo "$week" > "$marker"
+                fi
+                ;;
 
-            add-channel)
-              require_name
-              if [ -z "$INPUT_URL" ] && [ -z "$INPUT_CHANNEL_ID" ]; then
-                echo "::error::Provide 'url' (or 'channel_id') for add-channel."
+              add-channel)
+                require_name
+                if [ -z "$INPUT_URL" ] && [ -z "$INPUT_CHANNEL_ID" ]; then
+                  echo "Provide 'url' (or 'channel_id') for add-channel."
+                  exit 1
+                fi
+                php -r "$boot"'
+                  $name = getenv("INPUT_NAME");
+                  $url = trim((string) getenv("INPUT_URL"));
+                  $id = trim((string) getenv("INPUT_CHANNEL_ID"));
+
+                  if (App\Models\Channel::where("name", $name)->exists()) {
+                      fwrite(STDERR, "A channel named \"$name\" already exists.\n");
+                      exit(1);
+                  }
+
+                  if ($id === "") {
+                      if (! str_starts_with($url, "@") && ! preg_match("#^(https?://|www\.)#", $url)) {
+                          $url = "@".$url;
+                      }
+                      $id = app(App\Actions\YouTube\ExtractYouTubeChannelId::class)->execute($url);
+                  }
+
+                  if (App\Models\Channel::where("channel_id", $id)->exists()) {
+                      fwrite(STDERR, "A channel with ID $id already exists.\n");
+                      exit(1);
+                  }
+
+                  $channel = App\Models\Channel::create([
+                      "name" => $name,
+                      "channel_id" => $id,
+                      "last_checked_at" => null,
+                  ]);
+                  echo "Added \"$name\" ($id). Running initial import...\n";
+                  app(App\Actions\CheckForVideos::class)->execute($channel);
+                  echo "Done.\n";
+                '
+                ;;
+
+              remove-channel)
+                require_name
+                php -r "$boot"'
+                  $name = getenv("INPUT_NAME");
+                  $channel = App\Models\Channel::where("name", $name)->first();
+                  if (! $channel) {
+                      fwrite(STDERR, "No channel named \"$name\".\n");
+                      exit(1);
+                  }
+                  $channel->videos()->delete();
+                  $channel->delete();
+                  echo "Removed \"$name\".\n";
+                '
+                ;;
+
+              mute-channel)
+                require_name
+                php artisan channels:mute "$INPUT_NAME" --no-interaction
+                ;;
+
+              add-excluded-word)
+                require_name
+                php artisan excluded-words:add "$INPUT_NAME" --no-interaction
+                ;;
+
+              remove-excluded-word)
+                require_name
+                php artisan excluded-words:remove "$INPUT_NAME" --no-interaction
+                ;;
+
+              list-channels)       php artisan channels:list --no-interaction ;;
+              list-videos)         php artisan videos:list --no-interaction ;;
+              list-excluded-words) php artisan excluded-words:list --no-interaction ;;
+              stats)               php artisan other:stats --no-interaction ;;
+              test-mail)           php artisan other:mail-test --no-interaction ;;
+              test-discord)        php artisan other:discord-webhook-test --no-interaction ;;
+              test-webhook)        php artisan other:post-test --no-interaction ;;
+
+              *)
+                echo "Unknown command: $COMMAND"
                 exit 1
-              fi
-              php -r "$boot"'
-                $name = getenv("INPUT_NAME");
-                $url = trim((string) getenv("INPUT_URL"));
-                $id = trim((string) getenv("INPUT_CHANNEL_ID"));
+                ;;
+            esac
+          }
 
-                if (App\Models\Channel::where("name", $name)->exists()) {
-                    fwrite(STDERR, "A channel named \"$name\" already exists.\n");
-                    exit(1);
-                }
+          # All output goes to a private file, never to the Actions log.
+          set +e
+          ( set -e; run_command ) > "$RUN_LOG" 2>&1
+          status=$?
+          set -e
 
-                if ($id === "") {
-                    if (! str_starts_with($url, "@") && ! preg_match("#^(https?://|www\.)#", $url)) {
-                        $url = "@".$url;
-                    }
-                    $id = app(App\Actions\YouTube\ExtractYouTubeChannelId::class)->execute($url);
-                }
+          ok=$([ "$status" -eq 0 ] && echo true || echo false)
+          tail -c 20000 "$RUN_LOG" > "$RUN_LOG.tail"
+          jq --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+             --arg command "$COMMAND" \
+             --arg trigger "$GITHUB_EVENT_NAME" \
+             --argjson ok "$ok" \
+             --rawfile output "$RUN_LOG.tail" \
+             '. + [{at: $at, command: $command, trigger: $trigger, ok: $ok, output: $output}] | .[-25:]' \
+             "$LOGS_FILE" > "$LOGS_FILE.new"
+          mv "$LOGS_FILE.new" "$LOGS_FILE"
+          rm -f "$RUN_LOG" "$RUN_LOG.tail"
 
-                if (App\Models\Channel::where("channel_id", $id)->exists()) {
-                    fwrite(STDERR, "A channel with ID $id already exists.\n");
-                    exit(1);
-                }
-
-                $channel = App\Models\Channel::create([
-                    "name" => $name,
-                    "channel_id" => $id,
-                    "last_checked_at" => null,
-                ]);
-                echo "Added \"$name\" ($id). Running initial import...\n";
-                app(App\Actions\CheckForVideos::class)->execute($channel);
-                echo "Done.\n";
-              '
-              ;;
-
-            remove-channel)
-              require_name
-              php -r "$boot"'
-                $name = getenv("INPUT_NAME");
-                $channel = App\Models\Channel::where("name", $name)->first();
-                if (! $channel) {
-                    fwrite(STDERR, "No channel named \"$name\".\n");
-                    exit(1);
-                }
-                $channel->videos()->delete();
-                $channel->delete();
-                echo "Removed \"$name\".\n";
-              '
-              ;;
-
-            mute-channel)
-              require_name
-              php artisan channels:mute "$INPUT_NAME" --no-interaction
-              ;;
-
-            add-excluded-word)
-              require_name
-              php artisan excluded-words:add "$INPUT_NAME" --no-interaction
-              ;;
-
-            remove-excluded-word)
-              require_name
-              php artisan excluded-words:remove "$INPUT_NAME" --no-interaction
-              ;;
-
-            list-channels)       writes=false; php artisan channels:list --no-interaction ;;
-            list-videos)         writes=false; php artisan videos:list --no-interaction ;;
-            list-excluded-words) writes=false; php artisan excluded-words:list --no-interaction ;;
-            stats)               writes=false; php artisan other:stats --no-interaction ;;
-            test-mail)           writes=false; php artisan other:mail-test --no-interaction ;;
-            test-discord)        writes=false; php artisan other:discord-webhook-test --no-interaction ;;
-            test-webhook)        writes=false; php artisan other:post-test --no-interaction ;;
-
-            *)
-              echo "::error::Unknown command: $COMMAND"
-              exit 1
-              ;;
-          esac
-
+          echo "status=$status" >> "$GITHUB_OUTPUT"
           echo "writes=$writes" >> "$GITHUB_OUTPUT"
+          echo "Finished '$COMMAND' with exit code $status. Output is on the page's Activity tab."
 
-      # Only save after a successful run. If notifications failed partway,
-      # the next run detects the same videos again: a duplicate alert is
-      # better than a missed one.
-      - name: Save database
-        if: steps.run.outputs.writes == 'true'
+      # The database is only updated after a successful write. If notifications
+      # failed partway, the next run detects the same videos again: a duplicate
+      # alert is better than a missed one. The run history is saved every time.
+      - name: Save data
+        if: always() && steps.run.outputs.status != ''
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+          WRITES: ${{ steps.run.outputs.writes }}
         run: |
-          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
-            -pass env:YCN_DB_PASSPHRASE \
-            -in "$DB_FILE" -out "$DATA_DIR/database.sqlite.enc"
+          encrypt() {
+            openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+              -pass env:YCN_DB_PASSPHRASE -in "$1" -out "$2"
+          }
+
+          if [ "$STATUS" = 0 ] && [ "$WRITES" = true ]; then
+            encrypt "$DB_FILE" "$DATA_DIR/database.sqlite.enc"
+          fi
+          encrypt "$LOGS_FILE" "$DATA_DIR/logs.json.enc"
 
           cd "$DATA_DIR"
           rm -rf .git
           git init --quiet --initial-branch "$DATA_BRANCH"
-          git add database.sqlite.enc
-          [ -f last-weekly-summary ] && git add last-weekly-summary
+          for file in database.sqlite.enc logs.json.enc last-weekly-summary; do
+            if [ -f "$file" ]; then git add "$file"; fi
+          done
           git -c user.name="github-actions[bot]" \
               -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-              commit --quiet -m "Update notifier database"
+              commit --quiet -m "Update notifier data"
           git push --quiet --force "$REMOTE" "$DATA_BRANCH"
-          echo "Database saved to $DATA_BRANCH."
+          echo "Data saved."
+
+      # Deployed on every run, even when nothing changed, so deploy times
+      # don't reveal when new videos appeared.
+      - name: Build page
+        if: always() && steps.run.outputs.status != ''
+        run: |
+          mkdir -p "$SITE_DIR"
+          cp .github/ycn-page/index.html .github/ycn-page/app.js \
+             .github/ycn-page/style.css .github/ycn-page/robots.txt "$SITE_DIR/"
+          php .github/ycn-page/export.php "$LOGS_FILE" "$SITE_DIR/data.json"
+
+      - name: Upload page
+        if: always() && steps.run.outputs.status != ''
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ${{ env.SITE_DIR }}
+          retention-days: 1
+
+      - name: Deploy page
+        id: deploy
+        if: always() && steps.run.outputs.status != ''
+        uses: actions/deploy-pages@v4
+
+      - name: Report result
+        if: always() && steps.run.outputs.status != ''
+        env:
+          STATUS: ${{ steps.run.outputs.status }}
+        run: |
+          if [ "$STATUS" != 0 ]; then
+            echo "::error::'$COMMAND' failed. See the Activity tab on the page for details."
+            exit 1
+          fi
