@@ -83,35 +83,53 @@ jobs:
     env:
       COMMAND: ${{ inputs.command || 'check' }}
       DATA_BRANCH: ycn-data
-      DATA_DIR: ${{ runner.temp }}/ycn-data
       DB_FILE: ${{ github.workspace }}/database/database.sqlite
-      LOGS_FILE: ${{ runner.temp }}/logs.json
-      RUN_LOG: ${{ runner.temp }}/run.log
-      SITE_DIR: ${{ runner.temp }}/site
       REMOTE: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
       YCN_DB_PASSPHRASE: ${{ secrets.YCN_DB_PASSPHRASE }}
       YCN_PAGE_PASSPHRASE: ${{ secrets.YCN_PAGE_PASSPHRASE }}
 
     steps:
       - name: Check passphrases
+        id: setup
         run: |
-          fail=false
+          problems=()
           for name in YCN_DB_PASSPHRASE YCN_PAGE_PASSPHRASE; do
             value="$(printenv "$name" || true)"
             if [ "${#value}" -lt 20 ]; then
-              echo "::error::Set the $name repository secret to a random string of at least 20 characters."
-              fail=true
+              problems+=("Set the $name repository secret to a random string of at least 20 characters.")
             fi
           done
-          if [ "$YCN_DB_PASSPHRASE" = "$YCN_PAGE_PASSPHRASE" ]; then
-            echo "::error::YCN_DB_PASSPHRASE and YCN_PAGE_PASSPHRASE must be different."
-            fail=true
+          if [ -n "$YCN_DB_PASSPHRASE" ] && [ "$YCN_DB_PASSPHRASE" = "$YCN_PAGE_PASSPHRASE" ]; then
+            problems+=("YCN_DB_PASSPHRASE and YCN_PAGE_PASSPHRASE must be different.")
           fi
-          [ "$fail" = false ]
+
+          if [ "${#problems[@]}" -eq 0 ]; then
+            # Working paths ($RUNNER_TEMP isn't available to job-level env).
+            {
+              echo "DATA_DIR=$RUNNER_TEMP/ycn-data"
+              echo "LOGS_FILE=$RUNNER_TEMP/logs.json"
+              echo "RUN_LOG=$RUNNER_TEMP/run.log"
+              echo "APP_ENV_FILE=$RUNNER_TEMP/app-env.sh"
+              echo "SITE_DIR=$RUNNER_TEMP/site"
+            } >> "$GITHUB_ENV"
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          # Scheduled runs skip quietly until the secrets exist, instead of
+          # failing (and emailing) every 30 minutes. Manual runs fail.
+          level=$([ "$GITHUB_EVENT_NAME" = schedule ] && echo notice || echo error)
+          for problem in "${problems[@]}"; do
+            echo "::$level::Notifier not configured: $problem"
+          done
+          [ "$level" = notice ]
 
       - uses: actions/checkout@v4
+        if: steps.setup.outputs.ready == 'true'
 
       - name: Setup PHP
+        if: steps.setup.outputs.ready == 'true'
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.4'
@@ -119,15 +137,18 @@ jobs:
           coverage: none
 
       - name: Cache vendor
+        if: steps.setup.outputs.ready == 'true'
         uses: actions/cache@v4
         with:
           path: vendor
           key: vendor-${{ runner.os }}-php8.4-${{ hashFiles('composer.lock') }}
 
       - name: Install Composer dependencies
+        if: steps.setup.outputs.ready == 'true'
         run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
 
       - name: Configure environment
+        if: steps.setup.outputs.ready == 'true'
         env:
           IN_ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
           IN_MAIL_HOST: ${{ secrets.MAIL_HOST }}
@@ -143,22 +164,25 @@ jobs:
           IN_USER_LANGUAGE: ${{ vars.USER_LANGUAGE }}
           IN_DISPATCH_WEEKLY_SUMMARY_EMAIL: ${{ vars.DISPATCH_WEEKLY_SUMMARY_EMAIL }}
         run: |
-          # Laravel reads real environment variables before .env. Only export
-          # values that are set: an empty ALERT_EMAILS would make the app
-          # try to email "".
+          # Laravel reads real environment variables before .env. Settings go
+          # into a runner-local file that later steps source, not $GITHUB_ENV:
+          # values in $GITHUB_ENV are listed in every later step's log header,
+          # and only secrets are masked there. Only set values are exported:
+          # an empty ALERT_EMAILS would make the app try to email "".
+          : > "$APP_ENV_FILE"
           for name in ALERT_EMAILS MAIL_HOST MAIL_PORT MAIL_USERNAME MAIL_PASSWORD \
                       MAIL_FROM_ADDRESS DISCORD_WEBHOOK_URL WEBHOOK_POST_URL \
                       MAIL_MAILER MAIL_SCHEME USER_TIMEZONE USER_LANGUAGE \
                       DISPATCH_WEEKLY_SUMMARY_EMAIL; do
             value="$(printenv "IN_$name" || true)"
             if [ -n "$value" ]; then
-              echo "$name=$value" >> "$GITHUB_ENV"
+              printf 'export %s=%q\n' "$name" "$value" >> "$APP_ENV_FILE"
             fi
           done
 
           # Without an SMTP host, log mail instead of failing to connect.
           if [ -z "$IN_MAIL_HOST" ] && [ -z "$IN_MAIL_MAILER" ]; then
-            echo "MAIL_MAILER=log" >> "$GITHUB_ENV"
+            echo "export MAIL_MAILER=log" >> "$APP_ENV_FILE"
           fi
 
           {
@@ -172,7 +196,11 @@ jobs:
           php artisan key:generate --force --no-interaction --quiet
 
       - name: Restore data
+        if: steps.setup.outputs.ready == 'true'
         run: |
+          # shellcheck source=/dev/null
+          . "$APP_ENV_FILE"
+
           decrypt() {
             openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
               -pass env:YCN_DB_PASSPHRASE -in "$1" -out "$2"
@@ -201,7 +229,11 @@ jobs:
 
       - name: Run command
         id: run
+        if: steps.setup.outputs.ready == 'true'
         run: |
+          # shellcheck source=/dev/null
+          . "$APP_ENV_FILE"
+
           # Inputs come from the event file rather than `env:` so their values
           # are never printed in this step's environment listing.
           read_input() { jq -r --arg k "$1" '.inputs[$k] // ""' "$GITHUB_EVENT_PATH"; }
@@ -229,6 +261,7 @@ jobs:
           # can't work without a terminal, so these call the app's own
           # actions directly. Inputs come in through env vars, never by
           # pasting them into PHP code.
+          # shellcheck disable=SC2016 # PHP code: single quotes on purpose
           boot='require getenv("GITHUB_WORKSPACE")."/vendor/autoload.php";
                 $app = require getenv("GITHUB_WORKSPACE")."/bootstrap/app.php";
                 $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();'
@@ -258,6 +291,7 @@ jobs:
                   echo "Provide 'url' (or 'channel_id') for add-channel."
                   exit 1
                 fi
+                # shellcheck disable=SC2016 # PHP code: single quotes on purpose
                 php -r "$boot"'
                   $name = getenv("INPUT_NAME");
                   $url = trim((string) getenv("INPUT_URL"));
@@ -293,6 +327,7 @@ jobs:
 
               remove-channel)
                 require_name
+                # shellcheck disable=SC2016 # PHP code: single quotes on purpose
                 php -r "$boot"'
                   $name = getenv("INPUT_NAME");
                   $channel = App\Models\Channel::where("name", $name)->first();
@@ -394,6 +429,8 @@ jobs:
       - name: Build page
         if: always() && steps.run.outputs.status != ''
         run: |
+          # shellcheck source=/dev/null
+          . "$APP_ENV_FILE"
           mkdir -p "$SITE_DIR"
           cp .github/ycn-page/index.html .github/ycn-page/app.js \
              .github/ycn-page/style.css .github/ycn-page/robots.txt "$SITE_DIR/"
