@@ -1,0 +1,306 @@
+name: Notifier
+
+# Runs YouTube Channel Notifier on GitHub Actions instead of a server.
+#
+# State (the SQLite database) lives on the `ycn-data` branch, encrypted with
+# the YCN_DB_PASSPHRASE secret. The branch is force-pushed as a single commit
+# on every run that changes data, so history never grows.
+#
+# Required secret:   YCN_DB_PASSPHRASE
+# Optional secrets:  ALERT_EMAILS, MAIL_HOST, MAIL_PORT, MAIL_USERNAME,
+#                    MAIL_PASSWORD, MAIL_FROM_ADDRESS, DISCORD_WEBHOOK_URL,
+#                    WEBHOOK_POST_URL
+# Optional vars:     MAIL_MAILER, MAIL_SCHEME, USER_TIMEZONE, USER_LANGUAGE,
+#                    DISPATCH_WEEKLY_SUMMARY_EMAIL
+
+on:
+  schedule:
+    # Every 30 minutes. GitHub runs schedules on a best-effort basis, so
+    # expect some delay. ~1,440 runs/month, within the 2,000 free minutes
+    # a private repo gets.
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      command:
+        description: What to run
+        type: choice
+        default: check
+        options:
+          - check
+          - add-channel
+          - remove-channel
+          - mute-channel
+          - list-channels
+          - list-videos
+          - add-excluded-word
+          - remove-excluded-word
+          - list-excluded-words
+          - stats
+          - test-mail
+          - test-discord
+          - test-webhook
+      name:
+        description: Channel label (add / remove / mute) or word (excluded words)
+        required: false
+      url:
+        description: Channel URL or @handle (add-channel only)
+        required: false
+      channel_id:
+        description: Channel ID, only if automatic extraction fails (add-channel only)
+        required: false
+
+# Every run reads and writes the same database, so runs must not overlap.
+# Note: GitHub keeps at most one *pending* run per group; if a manual run is
+# queued behind a running one and a scheduled run queues too, the manual run
+# is cancelled. Just re-run it.
+concurrency:
+  group: ycn-database
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    env:
+      COMMAND: ${{ inputs.command || 'check' }}
+      DATA_BRANCH: ycn-data
+      DATA_DIR: ${{ runner.temp }}/ycn-data
+      DB_FILE: ${{ github.workspace }}/database/database.sqlite
+      REMOTE: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+      YCN_DB_PASSPHRASE: ${{ secrets.YCN_DB_PASSPHRASE }}
+
+    steps:
+      - name: Check passphrase is set
+        run: |
+          if [ -z "$YCN_DB_PASSPHRASE" ]; then
+            echo "::error::Set the YCN_DB_PASSPHRASE repository secret first."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: mbstring, dom, simplexml, pdo_sqlite
+          coverage: none
+
+      - name: Cache vendor
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-${{ runner.os }}-php8.4-${{ hashFiles('composer.lock') }}
+
+      - name: Install Composer dependencies
+        run: composer install --no-dev --prefer-dist --no-interaction --no-progress --optimize-autoloader
+
+      - name: Configure environment
+        env:
+          IN_ALERT_EMAILS: ${{ secrets.ALERT_EMAILS }}
+          IN_MAIL_HOST: ${{ secrets.MAIL_HOST }}
+          IN_MAIL_PORT: ${{ secrets.MAIL_PORT }}
+          IN_MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+          IN_MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+          IN_MAIL_FROM_ADDRESS: ${{ secrets.MAIL_FROM_ADDRESS }}
+          IN_DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          IN_WEBHOOK_POST_URL: ${{ secrets.WEBHOOK_POST_URL }}
+          IN_MAIL_MAILER: ${{ vars.MAIL_MAILER }}
+          IN_MAIL_SCHEME: ${{ vars.MAIL_SCHEME }}
+          IN_USER_TIMEZONE: ${{ vars.USER_TIMEZONE }}
+          IN_USER_LANGUAGE: ${{ vars.USER_LANGUAGE }}
+          IN_DISPATCH_WEEKLY_SUMMARY_EMAIL: ${{ vars.DISPATCH_WEEKLY_SUMMARY_EMAIL }}
+        run: |
+          # Laravel reads real environment variables before .env. Only export
+          # values that are set: an empty ALERT_EMAILS would make the app
+          # try to email "".
+          for name in ALERT_EMAILS MAIL_HOST MAIL_PORT MAIL_USERNAME MAIL_PASSWORD \
+                      MAIL_FROM_ADDRESS DISCORD_WEBHOOK_URL WEBHOOK_POST_URL \
+                      MAIL_MAILER MAIL_SCHEME USER_TIMEZONE USER_LANGUAGE \
+                      DISPATCH_WEEKLY_SUMMARY_EMAIL; do
+            value="$(printenv "IN_$name" || true)"
+            if [ -n "$value" ]; then
+              echo "$name=$value" >> "$GITHUB_ENV"
+            fi
+          done
+
+          # Without an SMTP host, log mail instead of failing to connect.
+          if [ -z "$IN_MAIL_HOST" ] && [ -z "$IN_MAIL_MAILER" ]; then
+            echo "MAIL_MAILER=log" >> "$GITHUB_ENV"
+          fi
+
+          {
+            echo "APP_ENV=production"
+            echo "APP_DEBUG=false"
+            echo "DB_CONNECTION=sqlite"
+            echo "LOG_CHANNEL=stderr"
+            echo "LOG_LEVEL=info"
+            echo "APP_KEY="
+          } > .env
+          php artisan key:generate --force --no-interaction
+
+      - name: Restore database
+        run: |
+          mkdir -p "$DATA_DIR"
+          if git ls-remote --exit-code --heads "$REMOTE" "$DATA_BRANCH" > /dev/null; then
+            git clone --quiet --depth 1 --branch "$DATA_BRANCH" "$REMOTE" "$DATA_DIR"
+            openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 \
+              -pass env:YCN_DB_PASSPHRASE \
+              -in "$DATA_DIR/database.sqlite.enc" -out "$DB_FILE"
+            echo "Database restored."
+          else
+            touch "$DB_FILE"
+            echo "No $DATA_BRANCH branch yet; starting with an empty database."
+          fi
+          php artisan migrate --force --no-interaction
+
+      - name: Run command
+        id: run
+        env:
+          INPUT_NAME: ${{ inputs.name }}
+          INPUT_URL: ${{ inputs.url }}
+          INPUT_CHANNEL_ID: ${{ inputs.channel_id }}
+        run: |
+          writes=true
+          require_name() {
+            if [ -z "$INPUT_NAME" ]; then
+              echo "::error::The 'name' input is required for $COMMAND."
+              exit 1
+            fi
+          }
+
+          # channels:add and channels:remove prompt interactively, which
+          # can't work without a terminal, so these call the app's own
+          # actions directly. Inputs come in through env vars, never by
+          # pasting them into PHP code.
+          boot='require getenv("GITHUB_WORKSPACE")."/vendor/autoload.php";
+                $app = require getenv("GITHUB_WORKSPACE")."/bootstrap/app.php";
+                $app->make(Illuminate\Contracts\Console\Kernel::class)->bootstrap();'
+
+          case "$COMMAND" in
+            check)
+              php artisan channels:check --no-interaction
+
+              # Weekly summary: send once per ISO week (UTC). This replaces
+              # the app's Monday 00:00 schedule and still works if a run
+              # was delayed or skipped.
+              marker="$DATA_DIR/last-weekly-summary"
+              week="$(date -u +%G-W%V)"
+              last="$(cat "$marker" 2>/dev/null || true)"
+              if [ -z "$last" ]; then
+                echo "$week" > "$marker"
+              elif [ "$last" != "$week" ]; then
+                php artisan summaries:dispatch-weekly-summary --no-interaction
+                echo "$week" > "$marker"
+              fi
+              ;;
+
+            add-channel)
+              require_name
+              if [ -z "$INPUT_URL" ] && [ -z "$INPUT_CHANNEL_ID" ]; then
+                echo "::error::Provide 'url' (or 'channel_id') for add-channel."
+                exit 1
+              fi
+              php -r "$boot"'
+                $name = getenv("INPUT_NAME");
+                $url = trim((string) getenv("INPUT_URL"));
+                $id = trim((string) getenv("INPUT_CHANNEL_ID"));
+
+                if (App\Models\Channel::where("name", $name)->exists()) {
+                    fwrite(STDERR, "A channel named \"$name\" already exists.\n");
+                    exit(1);
+                }
+
+                if ($id === "") {
+                    if (! str_starts_with($url, "@") && ! preg_match("#^(https?://|www\.)#", $url)) {
+                        $url = "@".$url;
+                    }
+                    $id = app(App\Actions\YouTube\ExtractYouTubeChannelId::class)->execute($url);
+                }
+
+                if (App\Models\Channel::where("channel_id", $id)->exists()) {
+                    fwrite(STDERR, "A channel with ID $id already exists.\n");
+                    exit(1);
+                }
+
+                $channel = App\Models\Channel::create([
+                    "name" => $name,
+                    "channel_id" => $id,
+                    "last_checked_at" => null,
+                ]);
+                echo "Added \"$name\" ($id). Running initial import...\n";
+                app(App\Actions\CheckForVideos::class)->execute($channel);
+                echo "Done.\n";
+              '
+              ;;
+
+            remove-channel)
+              require_name
+              php -r "$boot"'
+                $name = getenv("INPUT_NAME");
+                $channel = App\Models\Channel::where("name", $name)->first();
+                if (! $channel) {
+                    fwrite(STDERR, "No channel named \"$name\".\n");
+                    exit(1);
+                }
+                $channel->videos()->delete();
+                $channel->delete();
+                echo "Removed \"$name\".\n";
+              '
+              ;;
+
+            mute-channel)
+              require_name
+              php artisan channels:mute "$INPUT_NAME" --no-interaction
+              ;;
+
+            add-excluded-word)
+              require_name
+              php artisan excluded-words:add "$INPUT_NAME" --no-interaction
+              ;;
+
+            remove-excluded-word)
+              require_name
+              php artisan excluded-words:remove "$INPUT_NAME" --no-interaction
+              ;;
+
+            list-channels)       writes=false; php artisan channels:list --no-interaction ;;
+            list-videos)         writes=false; php artisan videos:list --no-interaction ;;
+            list-excluded-words) writes=false; php artisan excluded-words:list --no-interaction ;;
+            stats)               writes=false; php artisan other:stats --no-interaction ;;
+            test-mail)           writes=false; php artisan other:mail-test --no-interaction ;;
+            test-discord)        writes=false; php artisan other:discord-webhook-test --no-interaction ;;
+            test-webhook)        writes=false; php artisan other:post-test --no-interaction ;;
+
+            *)
+              echo "::error::Unknown command: $COMMAND"
+              exit 1
+              ;;
+          esac
+
+          echo "writes=$writes" >> "$GITHUB_OUTPUT"
+
+      # Only save after a successful run. If notifications failed partway,
+      # the next run detects the same videos again: a duplicate alert is
+      # better than a missed one.
+      - name: Save database
+        if: steps.run.outputs.writes == 'true'
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt \
+            -pass env:YCN_DB_PASSPHRASE \
+            -in "$DB_FILE" -out "$DATA_DIR/database.sqlite.enc"
+
+          cd "$DATA_DIR"
+          rm -rf .git
+          git init --quiet --initial-branch "$DATA_BRANCH"
+          git add database.sqlite.enc
+          [ -f last-weekly-summary ] && git add last-weekly-summary
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet -m "Update notifier database"
+          git push --quiet --force "$REMOTE" "$DATA_BRANCH"
+          echo "Database saved to $DATA_BRANCH."
