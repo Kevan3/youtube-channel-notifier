@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <!-- Nothing loads from anywhere but this site, except YouTube thumbnails
+       when the viewer turns them on. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' https://i.ytimg.com; connect-src 'self'; base-uri 'none'; form-action 'none'">
+  <meta name="referrer" content="no-referrer">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <title>Video List</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main id="lock" class="lock">
+    <form id="unlock-form" class="lock-card" autocomplete="on">
+      <h1>Video List</h1>
+      <p class="muted">This page is encrypted. Enter the passphrase to view it.
+        Decryption happens in your browser; the passphrase is never sent anywhere.</p>
+      <input type="text" name="username" value="ycn" autocomplete="username" hidden>
+      <label for="passphrase">Passphrase</label>
+      <input id="passphrase" name="password" type="password" autocomplete="current-password" required autofocus>
+      <button id="unlock-button" type="submit">Unlock</button>
+      <p id="unlock-error" class="error" role="alert" hidden></p>
+    </form>
+  </main>
+
+  <div id="app" hidden>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <div class="brand">
+          <strong>Video List</strong>
+          <span id="updated" class="muted"></span>
+        </div>
+        <div class="topbar-actions">
+          <label class="switch" title="Thumbnails load from YouTube's servers, which lets Google see your IP address.">
+            <input id="thumbs" type="checkbox">
+            <span>Thumbnails</span>
+          </label>
+          <button id="lock-button" type="button" class="secondary">Lock</button>
+        </div>
+      </div>
+      <nav class="tabs" role="tablist">
+        <button type="button" role="tab" data-tab="videos" aria-selected="true">Videos <span id="count-videos" class="count"></span></button>
+        <button type="button" role="tab" data-tab="channels" aria-selected="false">Channels <span id="count-channels" class="count"></span></button>
+        <button type="button" role="tab" data-tab="activity" aria-selected="false">Activity <span id="activity-status"></span></button>
+      </nav>
+    </header>
+
+    <section id="tab-videos" class="panel">
+      <div class="toolbar">
+        <input id="search" type="search" placeholder="Search titles" aria-label="Search titles">
+        <select id="channel-filter" aria-label="Channel">
+          <option value="">All channels</option>
+        </select>
+        <label class="check"><input id="hide-muted" type="checkbox"> Hide muted</label>
+      </div>
+      <p id="video-summary" class="muted small"></p>
+      <div id="video-list"></div>
+      <button id="show-more" type="button" class="secondary wide" hidden>Show more</button>
+    </section>
+
+    <section id="tab-channels" class="panel" hidden>
+      <div id="channel-list" class="channel-grid"></div>
+      <h2 class="section-title">Excluded words</h2>
+      <p id="excluded-words" class="muted"></p>
+    </section>
+
+    <section id="tab-activity" class="panel" hidden>
+      <p class="muted small">The most recent workflow runs. Their output is kept out of the public Actions logs and only shown here.</p>
+      <div id="activity-list"></div>
+    </section>
+  </div>
+</body>
+</html>
