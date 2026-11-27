@@ -55,9 +55,13 @@
         <select id="channel-filter" aria-label="Channel">
           <option value="">All channels</option>
         </select>
-        <label class="check"><input id="hide-muted" type="checkbox"> Hide muted</label>
+        <div class="toolbar-checks">
+          <label class="check"><input id="hide-muted" type="checkbox"> Hide muted</label>
+          <label class="check"><input id="show-removed" type="checkbox"> Show removed</label>
+        </div>
       </div>
       <p id="video-summary" class="muted small"></p>
+      <p id="storage-notice" class="notice small" role="status" hidden></p>
       <div id="video-list"></div>
       <button id="show-more" type="button" class="secondary wide" hidden>Show more</button>
     </section>
@@ -72,6 +76,11 @@
       <p class="muted small">The most recent workflow runs. Their output is kept out of the public Actions logs and only shown here.</p>
       <div id="activity-list"></div>
     </section>
+
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+      <span id="toast-text"></span>
+      <button id="toast-undo" type="button">Undo</button>
+    </div>
   </div>
 </body>
 </html>
